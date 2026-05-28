@@ -26,6 +26,8 @@ resp, err := client.Get("https://api.example.com/data")
 - [How it works](#how-it-works)
 - [Why not a static threshold?](#why-not-a-static-threshold)
 - [Streaming / LLM inference](#streaming--llm-inference)
+  - [Benchmark results](#benchmark-results)
+  - [End-to-end latency](#end-to-end-latency)
 - [gRPC support](#grpc-support)
 - [Configuration](#configuration)
 - [Observability](#observability)
@@ -38,12 +40,14 @@ resp, err := client.Get("https://api.example.com/data")
 
 50,000 requests against a simulated backend with lognormal base latency (mean=5ms, stddev=2ms) and 5% straggler probability (10x multiplier).
 
+
 | Configuration    |  p50  |  p90  |   p95  |   p99  |  p999   | Overhead |
 |------------------|-------|-------|--------|--------|---------|----------|
 | No hedging       | 5.0ms | 8.9ms | 17.1ms | 64.3ms | 104.5ms |    0.0%  |
 | Static 10ms      | 5.0ms | 8.9ms | 13.1ms | 17.4ms |  46.5ms |    7.4%  |
 | Static 50ms      | 5.0ms | 8.9ms | 18.9ms | 54.7ms |  60.2ms |    2.1%  |
 | Adaptive (hedge) | 5.0ms | 8.9ms | 12.3ms | 17.0ms |  59.4ms |    8.9%  |
+
 
 Adaptive matches the best hand-tuned static threshold at p99 (17.0ms vs 17.4ms) with no manual configuration. Static 50ms is too conservative at p95 (18.9ms vs 12.3ms); static 10ms over-hedges at p999 relative to adaptive. In production, where latency shifts with load and deployments, a fixed threshold goes stale; adaptive does not.
 
@@ -54,11 +58,17 @@ Reproduce: `cd benchmark/simulate && go run .`
 
 ## How it works
 
-**1. DDSketch quantile estimator.** Each target host gets a `WindowedSketch`, a pair of DDSketches rotating every 30 seconds. DDSketch uses logarithmic bucket mapping to provide relative-error guarantees: any quantile estimate is within ±1% of the true value, regardless of the value's magnitude. This matters for latency: a 1% error on a 10ms p90 is 0.1ms, not a fixed absolute error. The rolling window ensures the sketch tracks current conditions, not the entire history.
+### DDSketch quantile estimator
 
-**2. Adaptive trigger.** On each request, the transport queries the sketch for the configured percentile (default p90). For the first 20 requests to a new host, before the sketch has enough samples, a fixed 10ms warmup delay is used instead. If the primary has not responded by that deadline, a backup request is fired using a child context derived from the caller's. Whichever response arrives first is returned; the loser's context is cancelled and its body drained to return the connection to the pool.
+Each target host gets a `WindowedSketch`, a pair of DDSketches rotating every 30 seconds. DDSketch uses logarithmic bucket mapping to provide relative-error guarantees: any quantile estimate is within ±1% of the true value, regardless of the value's magnitude. This matters for latency: a 1% error on a 10ms p90 is 0.1ms, not a fixed absolute error. The rolling window ensures the sketch tracks current conditions, not the entire history.
 
-**3. Token bucket budget.** Hedges are rate-limited by a token bucket that refills at `estimatedRPS × budgetPercent / 100` tokens per second (defaults: 100 RPS, 10%). During genuine outages, when every request stalls and the p90 estimate collapses to the minimum delay, the bucket drains within seconds and hedging stops, preventing the load-doubling spiral that would deepen the incident.
+### Adaptive trigger
+
+On each request, the transport queries the sketch for the configured percentile (default p90). For the first 20 requests to a new host, before the sketch has enough samples, a fixed 10ms warmup delay is used instead. If the primary has not responded by that deadline, a backup request is fired using a child context derived from the caller's. Whichever response arrives first is returned; the loser's context is cancelled and its body drained to return the connection to the pool.
+
+### Token bucket budget
+
+Hedges are rate-limited by a token bucket that refills at `estimatedRPS × budgetPercent / 100` tokens per second (defaults: 100 RPS, 10%). During genuine outages, when every request stalls and the p90 estimate collapses to the minimum delay, the bucket drains within seconds and hedging stops, preventing the load-doubling spiral that would deepen the incident.
 
 
 ## Why not a static threshold?
@@ -72,7 +82,9 @@ Most HTTP servers delay headers until the response is ready, so time-to-first-he
 
 hedge records latency at first body byte via `ttftBody.Read`, not at header receipt. This gives the sketch the correct signal for prefill-disaggregated architectures where the header and the first token arrive tens to hundreds of milliseconds apart.
 
-**Benchmark results** -- streaming server (200 OK flushed immediately; first token delayed):
+### Benchmark results
+
+streaming server (200 OK flushed immediately; first token delayed):
 
 | Mode               |  p50   |  p90    |  p95    |  p99    | LatencyEstimate(p80) |
 |--------------------|--------|---------|---------|---------|----------------------|
@@ -81,7 +93,9 @@ hedge records latency at first body byte via `ttftBody.Read`, not at header rece
 
 A hedge calibrated from the TTFB sketch would use a ~1ms delay and fire a redundant request on virtually every call. Calibrated from TTFT, it fires only on the slow 20% (cache misses).
 
-**End-to-end latency** -- gateway server (TTFH ≈ TTFT, hedge fires while blocked on headers):
+### End-to-end latency 
+
+gateway server (TTFH ~ TTFT, hedge fires while blocked on headers):
 
 | Mode                          |  p50   |  p90    |  p95    |  p99    | Overhead |
 |-------------------------------|--------|---------|---------|---------|----------|
